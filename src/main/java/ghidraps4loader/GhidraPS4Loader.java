@@ -28,26 +28,21 @@ import org.w3c.dom.*;
 import org.xml.sax.SAXException;
 
 import ghidra.framework.Application;
-import generic.util.Path;
-import ghidra.app.plugin.assembler.sleigh.util.GhidraDBTransaction;
 import ghidra.app.util.Option;
 import ghidra.app.util.bin.ByteProvider;
-import ghidra.app.util.importer.MemoryConflictHandler;
-import ghidra.app.util.importer.MessageLog;
-import ghidra.app.util.opinion.LoadSpec;
 import ghidra.app.util.opinion.BinaryLoader;
+import ghidra.app.util.opinion.LoadException;
+import ghidra.app.util.opinion.LoadSpec;
+import ghidra.app.util.opinion.Loaded;
 import ghidra.framework.model.DomainObject;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
-import ghidra.program.model.lang.CompilerSpec;
 import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.LanguageCompilerSpecPair;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.*;
-import ghidra.framework.model.DomainFolder;
 import ghidra.util.exception.CancelledException;
-import ghidra.util.task.TaskMonitor;
 import ghidra.app.util.bin.format.elf.ElfHeader;
 import ghidra.app.util.bin.format.elf.ElfException;
 
@@ -126,99 +121,109 @@ public class GhidraPS4Loader extends BinaryLoader {
 	}
 
 	@Override
-	protected List<Program> loadProgram(ByteProvider provider, String programName,
-			DomainFolder programFolder, LoadSpec loadSpec, List<Option> options, MessageLog log,
-			Object consumer, TaskMonitor monitor)
-			throws IOException, CancelledException {
-        LanguageCompilerSpecPair pair = loadSpec.getLanguageCompilerSpec();
-        Language importerLanguage = getLanguageService().getLanguage(pair.languageID);
-        CompilerSpec importerCompilerSpec = importerLanguage.getCompilerSpecByID(pair.compilerSpecID);
-        Address baseAddress = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(0);
-        List<Program> results = new ArrayList<Program>();
-        boolean success = false;
-		
-		Program program = createProgram(provider, programName, baseAddress, getName(), importerLanguage, importerCompilerSpec, consumer);
-		
+	protected List<Loaded<Program>> loadProgram(ImporterSettings settings)
+			throws IOException, LoadException, CancelledException {
+		LanguageCompilerSpecPair pair = settings.loadSpec().getLanguageCompilerSpec();
+		Language importerLanguage = getLanguageService().getLanguage(pair.languageID);
+		Address baseAddress = getBaseAddress(settings.options(), importerLanguage);
+		Program program = createProgram(baseAddress, settings);
+		Loaded<Program> loaded = new Loaded<Program>(program, settings);
+		boolean success = false;
+
 		try {
-			success = this.loadInto(provider, loadSpec, options, log, program, monitor, MemoryConflictHandler.ALWAYS_OVERWRITE);
+			loadInto(program, settings);
+
+			// Start a transaction on the program database
+			int transactionID = program.startTransaction("PlayStation 4 Loader");
+			boolean transactionSuccess = false;
+			try {
+				// Function manager
+				FunctionManager funcManager = program.getFunctionManager();
+
+				// ELF Header
+				ElfHeader elfHeader;
+				try {
+					elfHeader = PS4ElfParser.getElfHeader(settings.provider());
+				} catch (ElfException e) {
+					throw new IOException("Failed to parse ELF header!");
+				}
+
+				// TODO: fix this, make it dynamic
+				long endOfHeader = 0x4000;
+
+				// Load all the imports from the XML file
+				Document ps4database;
+				try {
+					ps4database = parsePS4Database();
+				} catch (Exception e) {
+					throw new IOException("Failed to load 'ps4database.xml'!");
+				}
+
+				// Parse all the imports
+				Map<Long, String> imports = PS4ElfParser.getSonyElfImports(settings.provider(), elfHeader);
+				if(imports.size() > 0) {
+					// Label all the imports
+					for(Map.Entry<Long, String> importEntry : imports.entrySet()) {
+						Long address = endOfHeader + importEntry.getKey();
+						String nid = importEntry.getValue();
+
+						Address addr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(address);
+
+						// Label the import
+						String name = getNameForNID(ps4database, nid);
+						AddressSet addrSet = new AddressSet(addr);
+						try {
+							funcManager.createFunction(name, addr, addrSet, SourceType.IMPORTED);
+						} catch (Exception ex) {
+							ex.printStackTrace();
+							System.out.println("error: could not created imported function '" + name + "'!");
+						}
+					}
+				}
+
+				// the entry point
+				long entryAddress = endOfHeader + elfHeader.e_entry();
+				Address entryAddr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(entryAddress);
+				AddressSet addrSet = new AddressSet(entryAddr);
+				try {
+					funcManager.createFunction("entrypoint", entryAddr, addrSet, SourceType.IMPORTED);
+				} catch (Exception ex) {
+					System.out.println("error: could not set up entrypoint function!");
+				}
+
+				transactionSuccess = true;
+			} finally {
+				program.endTransaction(transactionID, transactionSuccess);
+			}
+
+			success = true;
+			return List.of(loaded);
 		} finally {
-			if(!success) {
-				program.release(consumer);
+			if (!success) {
+				loaded.close();
 			}
 		}
-		
-        if (success) {
-        	// Start a transaction on the program database
-        	GhidraDBTransaction trans = new GhidraDBTransaction(program, "PlayStation 4 Loader");
-        	
-        	// Function manager
-        	FunctionManager funcManager = program.getFunctionManager();
-        	
-        	// ELF Header
-    		ElfHeader elfHeader;
-    		try {
-    			elfHeader = PS4ElfParser.getElfHeader(provider);
-    		} catch (ElfException e) {
-    			throw new IOException("Failed to parse ELF header!");
-    		}
-    		
-    		// TODO: fix this, make it dynamic
-    		long endOfHeader = 0x4000;
-    		
-        	// Load all the imports from the XML file
-    		Document ps4database;
-        	try {
-        		ps4database = parsePS4Database();
-			} catch (Exception e) {
-				throw new IOException("Failed to load 'ps4database.xml'!");
-			}
-        	
-        	// Parse all the imports
-        	Map<Long, String> imports = PS4ElfParser.getSonyElfImports(provider, elfHeader);
-        	if(imports.size() > 0) {
-	        	// Label all the imports
-	        	for(Map.Entry<Long, String> importEntry : imports.entrySet()) {
-	        		Long address = endOfHeader + importEntry.getKey();
-	        		String nid = importEntry.getValue();
-	        		
-	        		Address addr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(address);
+	}
 
-	        		// Label the import
-	        		String name = getNameForNID(ps4database, nid);
-	        		AddressSet addrSet = new AddressSet(addr);
-	        		try {
-        				 funcManager.createFunction(name, addr, addrSet, SourceType.IMPORTED);
-					} catch (Exception ex) {
-						ex.printStackTrace();
-						System.out.println("error: could not created imported function '" + name + "'!");
-					}
-	        	}
-        	}
-        	
-        	// the entry point
-        	long entryAddress = endOfHeader + elfHeader.e_entry();
-        	Address entryAddr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(entryAddress);
-        	AddressSet addrSet = new AddressSet(entryAddr);
-        	try {
-				 funcManager.createFunction("entrypoint", entryAddr, addrSet, SourceType.IMPORTED);
-			} catch (Exception ex) {
-				System.out.println("error: could not set up entrypoint function!");
+	private Address getBaseAddress(List<Option> options, Language language) {
+		Address baseAddress = null;
+		if (options != null) {
+			for (Option option : options) {
+				if (option.getName().equals(BinaryLoader.OPTION_NAME_BASE_ADDR)) {
+					baseAddress = (Address) option.getValue();
+				}
 			}
-        	
-        	trans.commit();
-        	trans.close();
-        	
-        	// Add the program to the results
-        	results.add(program);
-        }
-		
-		return results;
+		}
+		if (baseAddress == null) {
+			baseAddress = language.getAddressFactory().getDefaultAddressSpace().getAddress(0);
+		}
+		return baseAddress;
 	}
 
 	@Override
 	public List<Option> getDefaultOptions(ByteProvider provider, LoadSpec loadSpec,
-			DomainObject domainObject, boolean isLoadIntoProgram) {
-		List<Option> list = super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram);
+			DomainObject domainObject, boolean isLoadIntoProgram, boolean mirrorFsLayout) {
+		List<Option> list = super.getDefaultOptions(provider, loadSpec, domainObject, isLoadIntoProgram, mirrorFsLayout);
 
 		// TODO: If this loader has custom options, add them to 'list'
 		//list.add(new Option("Option name goes here", "Default option value goes here"));
@@ -227,11 +232,12 @@ public class GhidraPS4Loader extends BinaryLoader {
 	}
 
 	@Override
-	public String validateOptions(ByteProvider provider, LoadSpec loadSpec, List<Option> options) {
+	public String validateOptions(ByteProvider provider, LoadSpec loadSpec, List<Option> options,
+			Program program) {
 
 		// TODO: If this loader has custom options, validate them here.  Not all options require
 		// validation.
 
-		return super.validateOptions(provider, loadSpec, options);
+		return super.validateOptions(provider, loadSpec, options, program);
 	}
 }

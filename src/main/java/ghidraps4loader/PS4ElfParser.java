@@ -4,12 +4,10 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.TreeMap;
 
-import generic.continues.RethrowContinuesFactory;
 import ghidra.app.util.bin.BinaryReader;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.format.elf.*;
 import ghidra.program.model.address.Address;
-import ghidra.app.util.bin.format.FactoryBundledWithBinaryReader;
 import ghidra.app.util.bin.format.elf.ElfDynamic;
 import ghidra.app.util.bin.format.elf.ElfDynamicTable;
 import ghidra.app.util.bin.format.elf.ElfException;
@@ -96,7 +94,7 @@ public class PS4ElfParser {
 	}
 	
 	public static ElfHeader getElfHeader(ByteProvider provider) throws ElfException, IOException {
-		ElfHeader elfHeader = ElfHeader.createElfHeader(RethrowContinuesFactory.INSTANCE, provider);
+		ElfHeader elfHeader = new ElfHeader(provider, message -> { });
 		elfHeader.parse();
 		return elfHeader;
 	}
@@ -104,17 +102,20 @@ public class PS4ElfParser {
 	public static Map<Long, String> getSonyElfImports(ByteProvider provider, ElfHeader elfHeader) throws IOException {
 		// Parse the specific Sony ELF region and build the map
 		BinaryReader br = new BinaryReader(provider, true);
-		FactoryBundledWithBinaryReader fbrdr = new FactoryBundledWithBinaryReader(RethrowContinuesFactory.INSTANCE, provider, true);
+		BinaryReader fbrdr = new BinaryReader(provider, true);
 		Map<Long, String> results = new TreeMap<Long, String>();
 		long dynlibdataAddr = 0;
 		
 		ElfDynamicTable dynTable = null;
 		for(ElfProgramHeader prog : elfHeader.getProgramHeaders()) {
 			if(prog.getTypeAsString().equals("PT_DYNAMIC")) {
-				dynTable = ElfDynamicTable.createDynamicTable(fbrdr, elfHeader, prog.getOffset(), prog.getVirtualAddress());
+				dynTable = new ElfDynamicTable(fbrdr, elfHeader, prog.getOffset(), prog.getVirtualAddress());
 			} else if(prog.getType() == PT_SCE_DYNLIBDATA) {
 				dynlibdataAddr = prog.getOffset();
 			} 
+		}
+		if(dynTable == null) {
+			return results;
 		}
 		
 		long symAddr = dynlibdataAddr;
